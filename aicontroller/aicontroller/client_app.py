@@ -1,8 +1,8 @@
-"""biometrichackathon: Flower ClientApp for SOCOFing."""
+"""Flower ClientApp for SOCOFing (unchanged logic, just filename)."""
 import torch
 from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
-from aicontroller.task  import Net, load_data, test as test_fn, train as train_fn
+from aicontroller.task import Net, load_data, test as test_fn, train as train_fn
 
 app = ClientApp()
 
