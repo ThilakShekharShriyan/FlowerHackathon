@@ -366,7 +366,7 @@ def _summarize_rounds(round_docs: List[Dict[str, Any]]) -> Dict[str, Any]:
     eval_acc = []
     for r in evals:
         agg = r.get("agg_metrics") or r.get("agg_metrics_server") or {}
-        acc = agg.get("eval_acc")
+        acc = None if not isinstance(agg, dict) else agg.get("eval_acc")
         if acc is None:
             cl = [cm.get("metrics", {}).get("eval_acc") for cm in r.get("client_metrics", [])]
             cl = [x for x in cl if isinstance(x, (int, float))]
@@ -459,6 +459,37 @@ def tool_suggest(run_id: Optional[str] = None, latest: bool = False) -> Dict[str
     _log_event("tool_result", name="suggest_next", proposal=proposal)
     return {"proposal": proposal, "summary": summ, "source_run_id": str(run_doc["_id"])}
 
+def tool_compare(strategies: Optional[List[str]] = None, limit: int = 50) -> Dict[str, Any]:
+    logger.debug("tool_compare: strategies=%s limit=%s", strategies, limit)
+    _log_event("tool_call", name="compare_strategies", strategies=strategies, limit=limit)
+    db = _db()
+    q: Dict[str, Any] = {}
+    if strategies:
+        q["run_config.strategy"] = {"$in": strategies}
+    runs = list(db["runs"].find(q).sort("started_at", -1).limit(int(limit)))
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for run in runs:
+        rid = run["_id"]
+        rc = run.get("run_config") or {}
+        strat = rc.get("strategy") or run.get("strategy") or "?"
+        rounds = list(db["rounds"].find({"run_id": rid}).sort([("round", 1), ("phase", 1)]))
+        summ = _summarize_rounds(rounds)
+        eval_accs = summ.get("eval_acc_by_round", [])
+        last_eval = next((x for x in reversed(eval_accs or []) if isinstance(x, (int, float))), None)
+        train_losses = summ.get("avg_train_loss_by_round", [])
+        last_train = next((x for x in reversed(train_losses or []) if isinstance(x, (int, float))), None)
+        item = {
+            "run_id": str(rid),
+            "best_eval_acc": summ.get("best_eval_acc"),
+            "last_eval_acc": last_eval,
+            "last_train_loss": last_train,
+            "num-server-rounds": rc.get("num-server-rounds"),
+            "lr": rc.get("lr"),
+        }
+        groups.setdefault(strat, []).append(item)
+    _log_event("tool_result", name="compare_strategies", count=sum(len(v) for v in groups.values()))
+    return groups
+
 # =========================
 # Parsing / normalization
 # =========================
@@ -501,13 +532,15 @@ def _extract_json(s: str) -> Dict[str, Any] | None:
         except Exception:
             return None
 
+_OID_RE = re.compile(r"^[0-9a-fA-F]{24}$")
 
 def _normalize_action(js: Dict[str, Any] | None, last_user: str) -> Dict[str, Any] | None:
-    """Accept compact actions and JSON stuffed into final.text."""
+    """Accept compact actions, synonyms, and JSON stuffed into final.text."""
     if not js:
         return None
     act = js.get("action")
 
+    # If final.text itself is JSON with an action, unwrap it
     if act == "final":
         txt = js.get("text", "")
         inner = _extract_json(txt)
@@ -515,14 +548,34 @@ def _normalize_action(js: Dict[str, Any] | None, last_user: str) -> Dict[str, An
             js = inner
             act = js.get("action")
 
-    if act in TOOL_NAMES:
-        name = act
-        args = js.get("args") or {}
-        return {"action": "tool", "name": name, "args": args}
+    # Map known synonyms -> our tool names
+    name = js.get("name")
+    args = js.get("args") or {}
+    run_id = js.get("run_id") or args.get("run_id") or args.get("id") or args.get("round_id")
 
+    if act in {"show", "display"} and (name in {"rounds", "show_rounds"} or js.get("target") == "rounds"):
+        if run_id and isinstance(run_id, str) and _OID_RE.match(run_id):
+            return {"action": "tool", "name": "show_rounds", "args": {"run_id": run_id}}
+
+    if act in {"next", "suggest"}:
+        return {"action": "tool", "name": "suggest_next", "args": {"run_id": run_id} if run_id else {}}
+
+    if act in {"get_run_summary", "summarize"}:
+        if run_id and isinstance(run_id, str) and _OID_RE.match(run_id):
+            return {"action": "tool", "name": "summarize_run", "args": {"run_id": run_id}}
+        return {"action": "tool", "name": "summarize_run", "args": {"latest": True}}
+
+    if act in {"get_run_details"}:
+        if run_id and isinstance(run_id, str) and _OID_RE.match(run_id):
+            return {"action": "tool", "name": "show_rounds", "args": {"run_id": run_id}}
+
+    # Compact form: {"action":"list_runs"} etc.
+    if act in TOOL_NAMES:
+        return {"action": "tool", "name": act, "args": args}
+
+    # Already tool-shaped
     if act == "tool":
         if js.get("name") == "run_flower":
-            args = js.get("args") or {}
             rc = args.get("run_config") or {}
             if not rc:
                 rc = _heuristic_parse_run_config(last_user)
@@ -567,6 +620,90 @@ def _maybe_local_run(user: str) -> bool:
         tail = "\n".join(res.get("stderr_tail", [])[-20:])
         if tail:
             console.print(Panel(tail, title="stderr tail"))
+    return True
+
+# --- Local deterministic shortcuts (no LLM roundtrip) -----------------
+
+def _maybe_local_show_rounds(user: str) -> bool:
+    m = re.match(r"show\s+rounds\s+([0-9a-fA-F]{24})\s*$", user, re.I)
+    if not m:
+        return False
+    run_id = m.group(1)
+    try:
+        res = tool_show_rounds(run_id=run_id)
+        _render_rounds(res.get("rounds", []))
+    except Exception as e:
+        console.print(f"[red]show rounds failed:[/red] {e}")
+    return True
+
+def _maybe_local_summarize(user: str) -> bool:
+    if re.fullmatch(r"summarize\s+(latest|the\s+latest\s+run)\s*$", user, re.I):
+        res = tool_summary(latest=True)
+        if "error" in res:
+            console.print(f"[red]{res['error']}[/red]")
+        else:
+            _render_summary(res)
+        return True
+    m = re.match(r"summarize\s+([0-9a-fA-F]{24})\s*$", user, re.I)
+    if m:
+        run_id = m.group(1)
+        res = tool_summary(run_id=run_id)
+        if "error" in res:
+            console.print(f"[red]{res['error']}[/red]")
+        else:
+            _render_summary(res)
+        return True
+    return False
+
+def _maybe_local_suggest(user: str) -> bool:
+    if re.fullmatch(r"(suggest\s+next|suggest)\s*$", user, re.I):
+        res = tool_suggest(latest=True)
+        if "proposal" in res:
+            p = res["proposal"]
+            console.print(Panel.fit(
+                Markdown(
+                    f"**Suggested next run**\n\n"
+                    f"- strategy: `{p.get('strategy')}`\n"
+                    f"- num-server-rounds: `{p.get('num-server-rounds')}`\n"
+                    f"- local-epochs: `{p.get('local-epochs')}`\n"
+                    f"- lr: `{p.get('lr')}`"
+                ),
+                title="Suggest Next"
+            ))
+        else:
+            console.print(f"[red]{res.get('error','no suggestion')}[/red]")
+        return True
+    m = re.match(r"suggest\s+([0-9a-fA-F]{24})\s*$", user, re.I)
+    if m:
+        run_id = m.group(1)
+        res = tool_suggest(run_id=run_id)
+        if "proposal" in res:
+            p = res["proposal"]
+            console.print(Panel.fit(
+                Markdown(
+                    f"**Suggested next run**\n\n"
+                    f"- strategy: `{p.get('strategy')}`\n"
+                    f"- num-server-rounds: `{p.get('num-server-rounds')}`\n"
+                    f"- local-epochs: `{p.get('local-epochs')}`\n"
+                    f"- lr: `{p.get('lr')}`"
+                ),
+                title="Suggest Next"
+            ))
+        else:
+            console.print(f"[red]{res.get('error','no suggestion')}[/red]")
+        return True
+    return False
+
+def _maybe_local_compare(user: str) -> bool:
+    # e.g. "compare strategies FedAvg, FedAdam (limit 20)"
+    m = re.match(r"compare\s+strategies\s+(.+?)(?:\s*\(limit\s*(\d+)\))?\s*$", user, re.I)
+    if not m:
+        return False
+    names_raw, lim = m.group(1), m.group(2)
+    strategies = [s.strip() for s in re.split(r"[,\s]+", names_raw) if s.strip()]
+    limit = int(lim) if lim else 50
+    res = tool_compare(strategies=strategies, limit=limit)
+    _render_compare(res)
     return True
 
 # =========================
@@ -643,7 +780,7 @@ def _render_rounds(rounds: List[Dict[str, Any]]):
     table.add_column("Train Loss")
     for r in rounds:
         agg = (r.get("agg_metrics") or r.get("agg_metrics_server") or {}) or {}
-        acc = agg.get("eval_acc")
+        acc = agg.get("eval_acc") if isinstance(agg, dict) else None
         cl = [cm.get("metrics", {}).get("train_loss") for cm in (r.get("client_metrics") or [])]
         cl = [x for x in cl if isinstance(x, (int, float))]
         tl = f"{(sum(cl)/len(cl)):.4f}" if cl else ""
@@ -763,6 +900,15 @@ def _chat_impl(model: str = "llama3.2:3b", log_level: str = "INFO"):
         # NEW: deterministic local run
         if _maybe_local_run(user):
             _print_status_line()
+            continue
+        # NEW: more deterministic shortcuts
+        if _maybe_local_show_rounds(user):
+            continue
+        if _maybe_local_summarize(user):
+            continue
+        if _maybe_local_suggest(user):
+            continue
+        if _maybe_local_compare(user):
             continue
 
         _log_event("user_input", text=user)

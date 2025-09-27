@@ -275,3 +275,6 @@ class TrackingStrategy:
         if err:
             raise err
         return result
+    
+
+    #run 1 rounds with FedAdam (lr 0.01, local-epochs 1, fraction-train 0.6)
