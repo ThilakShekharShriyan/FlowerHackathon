@@ -5,13 +5,15 @@ LLM-powered Terminal Agent for Flower + Mongo (human-style UI)
 
 - Natural narration (no raw JSON shown).
 - Local commands: `status`, `tool list`, `list runs`, `unlock`.
-- NEW: Local *run* shortcut — typing:
+- Local *run* shortcut — e.g.:
       run 1 rounds with FedAvg (lr 0.01, local-epochs 2, fraction-train 0.6)
-  immediately launches Flower without relying on the model to emit tool JSON.
+  launches Flower directly (no model roundtrip).
 
-Keeps:
-- Ollama local model (chat -> generate fallback).
-- Mongo logging and run-lock.
+- Federation-aware:
+  - Set env var AIC_FEDERATION=local (or FLWR_FEDERATION) to target SuperLink.
+  - The agent now calls: flwr run . <federation> --run-config ... --stream
+
+- LLM Provider: Google Gemini via google-genai (set GOOGLE_API_KEY).
 """
 
 from __future__ import annotations
@@ -28,7 +30,6 @@ from typing import Any, Dict, List, Optional, Sequence
 import shutil
 from pathlib import Path
 
-import requests
 import typer
 from bson import ObjectId
 from pymongo import MongoClient
@@ -38,6 +39,30 @@ from rich.markdown import Markdown
 from rich.logging import RichHandler
 from rich.table import Table
 from rich.panel import Panel
+
+# Google ADK wrapper
+from aicontroller.adk_agent import chat as adk_chat, extract_json as adk_extract_json, normalize_action as adk_normalize_action
+
+# Shared tools and UI
+from aicontroller.agent_tools import (
+    tool_run,
+    tool_list_runs,
+    tool_show_rounds,
+    tool_summary,
+    tool_suggest,
+    tool_compare,
+    _heuristic_parse_run_config,
+    _lockfile_path,
+    _active_run_doc,
+)
+from aicontroller.ui_render import (
+    render_tool_list,
+    render_runs,
+    render_rounds,
+    render_summary,
+    render_compare,
+    print_status_line,
+)
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
@@ -141,10 +166,6 @@ TOOL_HELP = {
 # Ollama chat (chat ➜ generate fallback)
 # =========================
 
-def _ollama_host() -> str:
-    return os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-
-
 def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
     out = []
     for m in messages:
@@ -155,68 +176,11 @@ def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
     return "".join(out)
 
 
-def _ollama_chat_try_chat(messages: List[Dict[str, str]], model: str, temperature: float) -> Optional[str]:
-    url = f"{_ollama_host()}/api/chat"
-    logger.debug("ollama_chat: trying /api/chat @ %s with %d messages", url, len(messages))
-    resp = requests.post(
-        url,
-        json={"model": model, "messages": messages, "stream": False, "options": {"temperature": temperature}},
-        timeout=120,
-    )
-    if resp.status_code in (404, 405):
-        logger.info("/api/chat unavailable (%s), falling back to /api/generate", resp.status_code)
-        return None
-    resp.raise_for_status()
-    data = resp.json()
-    if "message" in data and "content" in data["message"]:
-        out = data["message"]["content"]
-    elif "messages" in data and data["messages"]:
-        out = data["messages"][-1].get("content", "")
-    else:
-        out = data.get("content") or ""
-    logger.debug("ollama_chat: /api/chat success, chars=%d", len(out))
-    return out
+# -------------------------
+# Google Gemini (google-genai)
+# -------------------------
 
-
-def _ollama_chat_generate(messages: List[Dict[str, str]], model: str, temperature: float) -> str:
-    url = f"{_ollama_host()}/api/generate"
-    prompt = _messages_to_prompt(messages)
-    logger.debug("ollama_chat: using /api/generate @ %s (prompt chars=%d)", url, len(prompt))
-    resp = requests.post(
-        url,
-        json={"model": model, "prompt": prompt, "stream": False, "options": {"temperature": temperature}},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    out = data.get("response", "")
-    logger.debug("ollama_chat: /api/generate success, chars=%d", len(out))
-    return out
-
-
-def _ollama_chat(messages: List[Dict[str, str]], model: str, temperature: float = 0.2) -> str:
-    try:
-        content = _ollama_chat_try_chat(messages, model, temperature)
-        if content is not None:
-            return content
-        return _ollama_chat_generate(messages, model, temperature)
-    except requests.HTTPError as e:
-        try:
-            err = e.response.json()
-            msg = err.get("error") or err
-        except Exception:
-            msg = str(e)
-        logger.error("Ollama HTTP error: %s | details=%s", e, msg)
-        _log_event("ollama_http_error", error=str(e), details=msg)
-        raise RuntimeError(f"Ollama HTTP error: {e}\nDetails: {msg}\nCheck `ollama pull <model>`")
-    except requests.ConnectionError as e:
-        logger.error("Cannot connect to Ollama @ %s: %s", _ollama_host(), e)
-        _log_event("ollama_connection_error", host=_ollama_host(), error=str(e))
-        raise RuntimeError(f"Cannot connect to Ollama at {_ollama_host()}.")
-    except Exception as e:
-        logger.exception("Ollama call failed")
-        _log_event("ollama_call_failed", error=str(e))
-        raise RuntimeError(f"Ollama call failed: {e}")
+# Google chat now provided by ADK wrapper (adk_agent.chat)
 
 # =========================
 # Run lock + helpers
@@ -263,6 +227,19 @@ def _release_run_lock() -> None:
         pass
 
 # =========================
+# Federation helpers
+# =========================
+
+_FED_OVERRIDE: Optional[str] = None  # set via "use federation <name>" or "run ... on <name>"
+
+def _federation_from_env() -> Optional[str]:
+    fed = os.getenv("AIC_FEDERATION") or os.getenv("FLWR_FEDERATION")
+    return fed.strip() if fed else None
+
+def _current_federation() -> Optional[str]:
+    return _FED_OVERRIDE or _federation_from_env()
+
+# =========================
 # Tools (internal)
 # =========================
 
@@ -283,7 +260,12 @@ def _format_run_config(d: Dict[str, Any]) -> str:
 
 def tool_run(run_config: Dict[str, Any], *, force: bool = False) -> Dict[str, Any]:
     cfg = _format_run_config(run_config)
-    cmd = ["flwr", "run", ".", "--run-config", cfg]
+    fed = _current_federation()
+    # Build: flwr run . [federation] --run-config "<cfg>" --stream
+    cmd = ["flwr", "run", "."]
+    if fed:
+        cmd.append(fed)
+    cmd += ["--run-config", cfg, "--stream"]
 
     flwr_path = shutil.which("flwr")
     if not flwr_path:
@@ -305,16 +287,15 @@ def tool_run(run_config: Dict[str, Any], *, force: bool = False) -> Dict[str, An
         return {"error": "run_in_progress", "lock": info}
 
     logger.info("tool_run: executing -> %s", " ".join(shlex.quote(c) for c in cmd))
-    _log_event("tool_call", name="run_flower", run_config=run_config, cwd=cwd)
+    _log_event("tool_call", name="run_flower", run_config=run_config, cwd=cwd, federation=fed)
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+        # Show streamed output in the terminal (since we passed --stream).
+        proc = subprocess.run(cmd, cwd=cwd, text=True, capture_output=False)
         result = {
             "command": " ".join(shlex.quote(c) for c in cmd),
             "cwd": cwd,
             "returncode": proc.returncode,
-            "stdout_tail": proc.stdout.splitlines()[-60:],
-            "stderr_tail": proc.stderr.splitlines()[-60:],
         }
         logger.info("tool_run: returncode=%s", proc.returncode)
         _log_event("tool_result", name="run_flower", returncode=proc.returncode)
@@ -365,8 +346,8 @@ def _summarize_rounds(round_docs: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     eval_acc = []
     for r in evals:
-        agg = r.get("agg_metrics") or r.get("agg_metrics_server") or {}
-        acc = None if not isinstance(agg, dict) else agg.get("eval_acc")
+        agg = (r.get("agg_metrics") or r.get("agg_metrics_server") or {}) or {}
+        acc = agg.get("eval_acc") if isinstance(agg, dict) else None
         if acc is None:
             cl = [cm.get("metrics", {}).get("eval_acc") for cm in r.get("client_metrics", [])]
             cl = [x for x in cl if isinstance(x, (int, float))]
@@ -458,6 +439,7 @@ def tool_suggest(run_id: Optional[str] = None, latest: bool = False) -> Dict[str
             break
     _log_event("tool_result", name="suggest_next", proposal=proposal)
     return {"proposal": proposal, "summary": summ, "source_run_id": str(run_doc["_id"])}
+
 
 def tool_compare(strategies: Optional[List[str]] = None, limit: int = 50) -> Dict[str, Any]:
     logger.debug("tool_compare: strategies=%s limit=%s", strategies, limit)
@@ -587,14 +569,30 @@ def _normalize_action(js: Dict[str, Any] | None, last_user: str) -> Dict[str, An
     return js
 
 # =========================
-# NEW: local "run ..." shortcut
+# NEW: local shortcuts (no LLM roundtrip)
 # =========================
+
+def _maybe_local_use_federation(user: str) -> bool:
+    # e.g. "use federation local" or "use federation myfed"
+    global _FED_OVERRIDE
+    m = re.match(r"use\s+federation\s+([A-Za-z0-9_\-\.]+)\s*$", user, re.I)
+    if not m:
+        return False
+    _FED_OVERRIDE = m.group(1)
+    console.print(f"[green]Federation set:[/green] {_FED_OVERRIDE}")
+    return True
 
 def _maybe_local_run(user: str) -> bool:
     """If the user typed a 'run ...' command, parse and launch immediately."""
     text = user.strip()
     if not text.lower().startswith("run"):
         return False
+
+    # Optional inline "on <federation>" suffix
+    inline_fed = None
+    m = re.search(r"\bon\s+([A-Za-z0-9_\-\.]+)\s*$", text, re.I)
+    if m:
+        inline_fed = m.group(1)
 
     rc = _heuristic_parse_run_config(text)
     # Defaults (can be overridden via env)
@@ -611,18 +609,16 @@ def _maybe_local_run(user: str) -> bool:
         "**Starting Flower run** with config:\n\n" +
         "\n".join(f"- `{k}` = `{v}`" for k, v in rc.items())
     ))
+    fed = inline_fed or _current_federation()
+    if fed:
+        console.print(f"[dim]Federation:[/dim] {fed}")
     res = tool_run(rc, force=False)
     code = res.get("returncode")
     if code == 0:
-        console.print("[green]Run launched[/green]")
+        console.print("[green]Run finished[/green]" if os.getenv("AIC_WAIT_FOR_RUN","0")=="1" else "[green]Run launched[/green]")
     else:
         console.print("[red]Run failed to launch[/red]")
-        tail = "\n".join(res.get("stderr_tail", [])[-20:])
-        if tail:
-            console.print(Panel(tail, title="stderr tail"))
     return True
-
-# --- Local deterministic shortcuts (no LLM roundtrip) -----------------
 
 def _maybe_local_show_rounds(user: str) -> bool:
     m = re.match(r"show\s+rounds\s+([0-9a-fA-F]{24})\s*$", user, re.I)
@@ -846,7 +842,7 @@ SYSTEM_PROMPT = (
     "otherwise just answer. After a tool runs you'll receive a short text summary."
 )
 
-def _chat_impl(model: str = "llama3.2:3b", log_level: str = "INFO"):
+def _chat_impl(model: str = "gemini-2.0-flash", log_level: str = "INFO"):
     global logger
     logger = init_logging(log_level)
 
@@ -857,14 +853,14 @@ def _chat_impl(model: str = "llama3.2:3b", log_level: str = "INFO"):
         _log_event("startup_error", error=str(e))
         raise typer.Exit(2)
 
-    _log_event("agent_start", model=model, ollama_host=_ollama_host())
-    logger.info("Agent started with model=%s (Ollama host=%s)", model, _ollama_host())
+    _log_event("agent_start", model=model, provider="google-genai")
+    logger.info("Agent started with model=%s (provider=google-genai)", model)
 
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": "Say 'Ready' plainly."},
     ]
-    content = _ollama_chat(messages, model=model)
+    content = adk_chat(messages, model=model)
     console.print(Markdown(content.strip() or "Ready"))
 
     while True:
@@ -882,13 +878,13 @@ def _chat_impl(model: str = "llama3.2:3b", log_level: str = "INFO"):
 
         # Local shortcuts (no LLM)
         if user.lower() == "status":
-            _print_status_line()
+            print_status_line(console, _lockfile_path(), _active_run_doc())
             continue
         if user.lower() in {"tool list", "tools"}:
-            _render_tool_list()
+            render_tool_list(console, TOOL_HELP)
             continue
         if user.lower() in {"list runs", "list"}:
-            _render_runs(tool_list_runs(limit=20)["runs"])
+            render_runs(console, tool_list_runs(limit=20)["runs"])
             continue
         if user.lower() == "unlock":
             try:
@@ -897,11 +893,11 @@ def _chat_impl(model: str = "llama3.2:3b", log_level: str = "INFO"):
             except FileNotFoundError:
                 console.print("[green]No lock present[/green]")
             continue
-        # NEW: deterministic local run
-        if _maybe_local_run(user):
-            _print_status_line()
+        if _maybe_local_use_federation(user):
             continue
-        # NEW: more deterministic shortcuts
+        if _maybe_local_run(user):
+            print_status_line(console, _lockfile_path(), _active_run_doc())
+            continue
         if _maybe_local_show_rounds(user):
             continue
         if _maybe_local_summarize(user):
@@ -916,8 +912,8 @@ def _chat_impl(model: str = "llama3.2:3b", log_level: str = "INFO"):
 
         # Inner loop: allow the model to call tools; we show only the final narration.
         while True:
-            content = _ollama_chat(messages, model=model)
-            js = _normalize_action(_extract_json(content), last_user=user)
+            content = adk_chat(messages, model=model)
+            js = adk_normalize_action(adk_extract_json(content), last_user=user)
 
             # Natural reply
             if not js or js.get("action") == "final" and js.get("name") is None:
@@ -939,18 +935,18 @@ def _chat_impl(model: str = "llama3.2:3b", log_level: str = "INFO"):
                             limit=int(args.get("limit", 20)),
                             strategy=args.get("strategy"),
                         )
-                        _render_runs(result.get("runs", []))
+                        render_runs(console, result.get("runs", []))
 
                     elif name == "show_rounds":
                         result = tool_show_rounds(run_id=args["run_id"])
-                        _render_rounds(result.get("rounds", []))
+                        render_rounds(console, result.get("rounds", []))
 
                     elif name == "summarize_run":
                         result = tool_summary(run_id=args.get("run_id"), latest=bool(args.get("latest", False)))
                         if "error" in result:
                             console.print(f"[red]{result['error']}[/red]")
                         else:
-                            _render_summary(result)
+                            render_summary(console, result)
 
                     elif name == "suggest_next":
                         result = tool_suggest(run_id=args.get("run_id"), latest=bool(args.get("latest", False)))
@@ -970,7 +966,7 @@ def _chat_impl(model: str = "llama3.2:3b", log_level: str = "INFO"):
 
                     elif name == "compare_strategies":
                         result = tool_compare(strategies=args.get("strategies"), limit=int(args.get("limit", 50)))
-                        _render_compare(result)
+                        render_compare(console, result)
 
                     elif name == "run_flower":
                         allowed = {"num-server-rounds","local-epochs","fraction-train","lr","strategy","label-mode","num-partitions","data-root"}
@@ -992,12 +988,9 @@ def _chat_impl(model: str = "llama3.2:3b", log_level: str = "INFO"):
                             result = tool_run(rc, force=bool(args.get("force", False)))
                             rc_code = result.get("returncode")
                             if rc_code == 0:
-                                console.print("[green]Run launched[/green]")
+                                console.print("[green]Run finished[/green]" if os.getenv("AIC_WAIT_FOR_RUN","0")=="1" else "[green]Run launched[/green]")
                             else:
                                 console.print("[red]Run failed to launch[/red]")
-                                err_tail = "\n".join(result.get("stderr_tail", [])[-10:])
-                                if err_tail:
-                                    console.print(Panel(err_tail, title="stderr tail"))
 
                     else:
                         result = {"error": f"unknown_tool:{name}"}
@@ -1013,7 +1006,7 @@ def _chat_impl(model: str = "llama3.2:3b", log_level: str = "INFO"):
                 messages.append({"role": "user", "content": f"tool_result {name}: {brief}"})
 
                 # Ask the model for a short narration/next step
-                content = _ollama_chat(messages, model=model)
+                content = adk_chat(messages, model=model)
                 messages.append({"role": "assistant", "content": content})
                 console.print(Markdown(content))
                 break
@@ -1029,7 +1022,7 @@ def _chat_impl(model: str = "llama3.2:3b", log_level: str = "INFO"):
 
 @app.command("status")
 def status_cmd():
-    _print_status_line()
+    print_status_line(console, _lockfile_path(), _active_run_doc())
 
 @app.command("unlock")
 def unlock_cmd():
@@ -1042,7 +1035,7 @@ def unlock_cmd():
 
 @app.command("chat")
 def chat_cmd(
-    model: str = typer.Option("llama3.2:3b", help="Ollama model name"),
+    model: str = typer.Option(os.getenv("AIC_GOOGLE_MODEL", "gemini-2.0-flash"), help="Gemini model name (google-genai)"),
     log_level: str = typer.Option("INFO", help="Log level: DEBUG, INFO, WARNING, ERROR"),
 ):
     _chat_impl(model=model, log_level=log_level)
@@ -1050,7 +1043,7 @@ def chat_cmd(
 @app.callback(invoke_without_command=True)
 def _default(
     ctx: typer.Context,
-    model: str = typer.Option("llama3.2:3b", "--model", help="Ollama model name"),
+    model: str = typer.Option(os.getenv("AIC_GOOGLE_MODEL", "gemini-2.0-flash"), "--model", help="Gemini model name (google-genai)"),
     log_level: str = typer.Option("INFO", "--log-level", help="Log level: DEBUG, INFO, WARNING, ERROR"),
 ):
     if ctx.invoked_subcommand is None:

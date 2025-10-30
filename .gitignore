@@ -1,1 +1,44 @@
 data/
+.env
+.env.local
+.env.*.local
+.DS_Store
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.log
+*.egg-info/
+dist/
+build/
+env/
+venv/
+.idea/
+*.iml
+*.swp
+*.swo
+*.bak
+aicontroller.egg-info/
+aicontroller/__pycache__/
+aicontroller/tests/__pycache__/
+aicontroller/.env
+aicontroller/env/
+aicontroller/.vscode/
+aicontroller/dist/
+aicontroller/build/
+# Project artifacts
+final_model.pt
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS temp files
+Thumbs.db
+Desktop.ini

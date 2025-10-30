@@ -1,10 +1,10 @@
-# AICONTROLLER – LLM-powered Federated Learning Controller (Flower + Mongo + Ollama)
+# AICONTROLLER – LLM-powered Federated Learning Controller (Flower + Mongo + Google Gemini)
 
 Run, track, and iterate on federated learning (FL) experiments **from a single terminal**.
 
 - **Flower** powers the server/client runtime.
 - **MongoDB** stores runs/rounds/metrics.
-- A lightweight **LLM agent** (via **Ollama**) turns natural language into actions like  
+- A lightweight **LLM agent** (via **Google Gemini** using `google-genai`) turns natural language into actions like  
   `run 3 rounds with FedAdam (lr 0.005, local-epochs 2, fraction-train 0.6)`  
   and suggests the **next** configuration based on results.
 
@@ -46,11 +46,11 @@ aicontroller/
 - **Python** 3.9+ (tested on 3.9)
 - **Flower** (>= 1.22 recommended)
 - **MongoDB** running locally (or set `MONGODB_URI`)
-- **Ollama** with a small chat model available (defaults to `llama3.2:3b`)
+- **Google API access** (set `GOOGLE_API_KEY`) and install `google-genai`
 - **PyTorch** (CPU is fine)
 - **SOCOFing** dataset (for the included demo task)
 
-> You can switch the Ollama model name in `llm_agent_cli.py` if you prefer another local model.
+> You can switch the Gemini model in `llm_agent_cli.py` or via `AIC_GOOGLE_MODEL`.
 
 ---
 
@@ -70,9 +70,7 @@ pip install -e .
 # 3) Optional quick checks
 flwr --version
 python -c "import pymongo; print('pymongo ok')"
-# If you want to sanity-check Ollama:
-# ollama pull llama3.2:3b
-# ollama run llama3.2:3b -p "Say ready."
+python -c "from google import genai; print('google-genai ok')"
 ```
 
 ---
@@ -105,8 +103,9 @@ Most have sensible defaults, but you can override:
 | --- | --- | --- |
 | `MONGODB_URI` | Mongo connection | `mongodb://localhost:27017` |
 | `MONGODB_DB` | Database name | `flwr_runs` |
-| `OLLAMA_HOST` | Ollama base URL | `http://localhost:11434` |
-| `AIC_DATA_ROOT` | Dataset root | `<repo>/data` (hardcoded in script in your user path) |
+| `GOOGLE_API_KEY` | API key for Gemini (google-genai) | — (required) |
+| `AIC_GOOGLE_MODEL` | Gemini model name | `gemini-2.0-flash` |
+| `AIC_DATA_ROOT` | Dataset root | `<repo>/data` |
 | `AIC_LABEL_MODE` | `binary` or `fourclass` | `binary` |
 | `AIC_NUM_PARTITIONS` | Num of client partitions | `5` |
 | `AIC_AGENT_LOG_LEVEL` | Agent logging | `INFO` |
@@ -118,13 +117,13 @@ Most have sensible defaults, but you can override:
 
 ## Run the agent
 
-From the project root (where `pyproject.toml` lives):
+From the app directory (`aicontroller/`):
 
 ```bash
+cd aicontroller
 source env/bin/activate
-python -m aicontroller.llm_agent_cli
-# or
-python aicontroller/llm_agent_cli.py
+export GOOGLE_API_KEY=<your_key>
+python -m aicontroller.llm_agent_cli --model "${AIC_GOOGLE_MODEL:-gemini-2.0-flash}"
 ```
 
 You’ll see a prompt like:
@@ -242,7 +241,55 @@ agent> compare strategies FedAvg, FedAdam (limit 10)
 You can bypass the agent and invoke Flower yourself:
 
 ```bash
+cd aicontroller && source env/bin/activate
 flwr run . --run-config 'num-server-rounds=3 local-epochs=2 fraction-train=0.6 lr=0.01 strategy="FedAvg" data-root="/ABS/PATH/TO/data" label-mode="binary" num-partitions=5'
+```
+
+---
+
+## Federation (SuperLink/SuperNodes)
+
+Start the federation in three terminals:
+
+```bash
+# Terminal 1: SuperLink
+flower-superlink \
+  --insecure \
+  --fleet-api-address 0.0.0.0:9092 \
+  --control-api-address 0.0.0.0:9093
+
+# Terminal 2: SuperNode (client partition 0)
+flower-supernode \
+  --insecure \
+  --superlink localhost:9092 \
+  --node-config 'partition-id=0 num-partitions=5'
+
+# Terminal 3: SuperNode (client partition 1)
+flower-supernode \
+  --insecure \
+  --superlink localhost:9092 \
+  --node-config 'partition-id=1 num-partitions=5' \
+  --clientappio-api-address 0.0.0.0:9095
+```
+
+Then launch the agent and target the configured federation `remote-federation` (from `pyproject.toml`):
+
+```bash
+cd aicontroller && source env/bin/activate
+export GOOGLE_API_KEY=<your_key>
+# Option A: env var
+export FLWR_FEDERATION=remote-federation
+python -m aicontroller.llm_agent_cli --model "${AIC_GOOGLE_MODEL:-gemini-2.0-flash}"
+# Option B: set inside the REPL
+# agent> use federation remote-federation
+```
+
+Run a short test round from the REPL:
+
+```text
+agent> run 1 rounds with FedAvg (lr 0.01, local-epochs 1, fraction-train 0.6)
+agent> list
+agent> summarize latest
 ```
 
 ---
@@ -255,14 +302,17 @@ flwr run . --run-config 'num-server-rounds=3 local-epochs=2 fraction-train=0.6 l
 - **Show/Suggest “does nothing”**  
   Use the **local** forms (`show rounds <id>`, `suggest next`) which bypass the LLM.
 
+- **“Project configuration could not be loaded. pyproject.toml does not exist.”**  
+  Run the agent from `aicontroller/` (where `pyproject.toml` lives) or set the working directory accordingly. The agent also auto-detects `aicontroller/` when launched from repo root.
+
 - **“run lock present”** after a crash  
   Run `unlock` at the prompt.
 
 - **Mongo not updating**  
   Ensure Mongo is reachable (`MONGODB_URI`). Collections used: `runs`, `rounds`.
 
-- **Ollama errors**  
-  Start Ollama and pull a model (`ollama pull llama3.2:3b`) or update the model name passed to the agent (`--model` flag in `chat` command).
+- **Gemini errors**  
+  Ensure `GOOGLE_API_KEY` is set and that your key has access to the requested model (e.g., `gemini-2.0-flash`). You can change the model via `--model` or `AIC_GOOGLE_MODEL`.
 
 - **Flower aggregate_* signature errors**  
   The included `tracking_strategy.py` handles multiple signatures. If you see version-mismatch issues, upgrade Flower and reinstall this package: `pip install -e .`
@@ -274,3 +324,19 @@ flwr run . --run-config 'num-server-rounds=3 local-epochs=2 fraction-train=0.6 l
 - Built for the Flower Hackathon; uses the excellent Flower FL framework.
 - Demo task adapted to the **SOCOFing** fingerprint dataset.
 - Local LLM orchestration via **Ollama**.
+
+
+### Test Commands
+
+status
+tool list
+list
+run 1 rounds with FedAvg (lr 0.01, local-epochs 1, fraction-train 0.6)
+status
+list
+summarize latest
+# replace <RUN_ID> with one from "list"
+show rounds <RUN_ID>
+suggest next
+compare strategies FedAvg, FedAdam (limit 5)
+unlock

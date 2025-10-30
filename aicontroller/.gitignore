@@ -1,3 +1,33 @@
+# Local virtualenvs
+env/
+.venv/
+venv/
+
+# Build / packaging
+dist/
+build/
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Agent logs and event streams (can be large / PII)
+*.log
+*.jsonl
+
+# Data (kept out of this repo; use AIC_DATA_ROOT to point to dataset)
+data/
+
+# Keep a placeholder file if you want to version an empty data folder
+!data/.gitkeep
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

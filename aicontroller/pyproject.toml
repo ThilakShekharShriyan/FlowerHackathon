@@ -1,21 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
 [project]
 name = "aicontroller"
-version = "1.0.3"
-description = "Flower FedLearn + SOCOFing + Mongo tracking + Agent"
-license = "Apache-2.0"
+version = "1.1.0"
+description = "Flower FedLearn + SOCOFing + Mongo tracking + Agent (Gemini via google-genai)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
 dependencies = [
     "flwr[simulation]>=1.22.0",
     "flwr-datasets[vision]>=0.5.0",
     "torch==2.7.1",
     "torchvision==0.22.1",
     "Pillow>=10.0.0",
-    "pydantic>=1.10,<2.0",
+    "pydantic>=2.7,<3.0",
     "PyYAML>=6.0",
     "pymongo>=4.6",
     "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",      
-    "openai>=1.37.0",
-    "pymongo>=4.6",
+    "uvicorn[standard]>=0.30",
+    "google-genai>=0.1.0",
     "typer[all]>=0.12",
     "rich>=13.7"
 ]
@@ -27,26 +32,31 @@ packages = ["."]
 publisher = "thilakshriyan"
 
 [tool.flwr.app.components]
+# <module>:<object>
 serverapp = "aicontroller.server_app:app"
 clientapp = "aicontroller.client_app:app"
 
 [tool.flwr.app.config]
+# Available at runtime via: context.run_config["num-server-rounds"], etc.
 num-server-rounds = 3
 fraction-train    = 0.5
 local-epochs      = 1
 lr                = 0.01
-data-root        = "/Users/spartan/Projects/FlowerHackathon/data"  
+data-root         = "/Users/spartan/Projects/FlowerHackathon/data"
 label-mode        = "binary"
 num-partitions    = 5
 strategy          = "FedAvg"
 
 [tool.flwr.federations]
+# Use remote by default; `flwr run` will connect to the SuperLink Control API below
 default = "remote-federation"
 
 [tool.flwr.federations.local-simulation]
+# Handy for quick local testing
 options.num-supernodes = 2
 
 [tool.flwr.federations.remote-federation]
+# Control API address of your SuperLink (matches --control-api-address)
 address  = "localhost:9093"
+# Running without TLS for simplicity in dev; turn this off and configure certs for prod
 insecure = true
-
