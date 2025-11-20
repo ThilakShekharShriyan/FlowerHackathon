@@ -5,7 +5,7 @@
 The dependencies are listed in the `pyproject.toml` and you can install them as follows:
 
 ```bash
-pip install -e .
+sourc
 ```
 
 > **Tip:** Your `pyproject.toml` file can define more than just the dependencies of your Flower app. You can also use it to specify hyperparameters for your runs and control which Flower Runtime is used. By default, it uses the Simulation Runtime, but you can switch to the Deployment Runtime when needed.
